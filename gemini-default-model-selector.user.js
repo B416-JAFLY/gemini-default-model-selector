@@ -2,7 +2,7 @@
 // @name         Gemini Default Model Selector
 // @name:zh-CN   Gemini 默认模型选择器
 // @namespace    https://github.com/B416-JAFLY/gemini-default-model-selector
-// @version      0.1.0
+// @version      0.2.1
 // @description  Automatically select your preferred Gemini model and thinking mode for every new chat.
 // @description:zh-CN 为 Gemini 新对话自动选择默认模型与思考强度，并提供随时可修改的设置面板。
 // @author       B416-JAFLY
@@ -27,6 +27,20 @@
   const MODE_BUTTON_SELECTOR =
     'button[aria-label*="模式选择器"], button[aria-label*="mode selector" i]';
   const THINKING_PATTERN = /^(扩展思考|Extended thinking)$/i;
+  const SEND_BUTTON_SELECTOR = [
+    'button[aria-label*="发送"]',
+    'button[aria-label*="Send" i]',
+    '[role="button"][aria-label*="发送"]',
+    '[role="button"][aria-label*="Send" i]',
+    '[data-test-id*="send" i]',
+  ].join(',');
+  const COMPOSER_SELECTOR = [
+    'textarea',
+    '[contenteditable="true"]',
+    '[role="textbox"]',
+    'rich-textarea',
+  ].join(',');
+  const INPUT_IDLE_DELAY = 1400;
   const DEFAULT_SETTINGS = Object.freeze({
     enabled: true,
     modelKey: 'flash',
@@ -64,6 +78,8 @@
     unavailable: '找不到所选模型，请重新打开设置并选择当前可用模型。',
     thinkingUnavailable: '当前模型没有可用的“扩展思考”选项。',
     resetDone: '已恢复为 Flash + 扩展思考',
+    deferred: '检测到输入框正在使用，模型切换会在你完成输入后进行。',
+    submitFallback: '默认模型暂未就绪，已按当前模型继续发送。',
   } : {
     button: 'Default model',
     buttonTitle: 'Configure Gemini default model',
@@ -85,6 +101,8 @@
     unavailable: 'The selected model is unavailable. Open settings and choose a current model.',
     thinkingUnavailable: 'Extended thinking is unavailable for this model.',
     resetDone: 'Reset to Flash + extended thinking',
+    deferred: 'The editor is in use. Model switching will resume after you finish typing.',
+    submitFallback: 'The default model was not ready, so the prompt was sent with the current model.',
   };
 
   let settings = loadSettings();
@@ -92,6 +110,12 @@
   let working = false;
   let navigationId = 1;
   let lastAppliedNavigationId = 0;
+  let lastAttemptNavigationId = 0;
+  let pendingAutoApply = false;
+  let lastUserInputAt = 0;
+  let userSelectedModel = false;
+  let replayingSubmit = false;
+  let submitting = false;
   let scheduleTimer = 0;
 
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -145,6 +169,89 @@
 
   function modeButton() {
     return [...document.querySelectorAll(MODE_BUTTON_SELECTOR)].find(isVisible) || null;
+  }
+
+  function sendButton() {
+    return [...document.querySelectorAll(SEND_BUTTON_SELECTOR)].find((element) => {
+      return isVisible(element) &&
+        element.getAttribute('aria-disabled') !== 'true' &&
+        !element.disabled;
+    }) || null;
+  }
+
+  function composerElement(element) {
+    if (!(element instanceof Element)) return null;
+    return element.closest(COMPOSER_SELECTOR);
+  }
+
+  function activeComposer() {
+    return composerElement(document.activeElement);
+  }
+
+  function modeControlElement(element) {
+    if (!(element instanceof Element)) return null;
+    return element.closest(
+      `${MODE_BUTTON_SELECTOR}, [role="menu"], [role="menuitem"]`,
+    );
+  }
+
+  function captureComposerFocus() {
+    const element = activeComposer();
+    if (!element) return null;
+
+    const snapshot = {
+      element,
+      capturedAt: Date.now(),
+      inputAtCapture: lastUserInputAt,
+    };
+    if ('selectionStart' in element && typeof element.selectionStart === 'number') {
+      snapshot.selectionStart = element.selectionStart;
+      snapshot.selectionEnd = element.selectionEnd;
+      snapshot.selectionDirection = element.selectionDirection;
+    } else {
+      const selection = document.getSelection();
+      if (selection?.rangeCount && element.contains(selection.anchorNode)) {
+        snapshot.range = selection.getRangeAt(0).cloneRange();
+      }
+    }
+    return snapshot;
+  }
+
+  function restoreComposerFocus(snapshot) {
+    if (!snapshot?.element?.isConnected || lastUserInputAt > snapshot.inputAtCapture) return;
+    snapshot.element.focus({ preventScroll: true });
+    if (snapshot.range) {
+      const selection = document.getSelection();
+      selection?.removeAllRanges();
+      selection?.addRange(snapshot.range);
+    } else if ('selectionStart' in snapshot.element && snapshot.selectionStart != null) {
+      snapshot.element.setSelectionRange(
+        snapshot.selectionStart,
+        snapshot.selectionEnd,
+        snapshot.selectionDirection,
+      );
+    }
+  }
+
+  function inputRecentlyUsed() {
+    return lastUserInputAt > 0 && Date.now() - lastUserInputAt < INPUT_IDLE_DELAY;
+  }
+
+  function userEditedAfter(snapshot) {
+    return Boolean(snapshot && lastUserInputAt > snapshot.inputAtCapture);
+  }
+
+  function shouldPauseForUserInput({ allowFocusedComposer = false } = {}) {
+    if (!allowFocusedComposer && activeComposer()) {
+      pendingAutoApply = true;
+      return true;
+    }
+    if (!allowFocusedComposer && inputRecentlyUsed()) {
+      pendingAutoApply = true;
+      scheduleAutoApply(INPUT_IDLE_DELAY - (Date.now() - lastUserInputAt) + 80);
+      return true;
+    }
+    return false;
   }
 
   function currentModeText(button = modeButton()) {
@@ -223,10 +330,11 @@
     return models || [];
   }
 
-  async function closeModeMenu() {
+  async function closeModeMenu(focusSnapshot = null) {
     if (!visibleMenuItems().length) return;
     modeButton()?.click();
     await waitFor(() => !visibleMenuItems().length, 2000);
+    restoreComposerFocus(focusSnapshot);
   }
 
   async function discoverModels() {
@@ -249,18 +357,33 @@
       currentThinkingMode(button) === preferredSettings.thinking;
   }
 
-  async function applyDefaults({ force = false, quiet = false } = {}) {
+  async function applyDefaults({
+    force = false,
+    quiet = false,
+    allowFocusedComposer = false,
+    focusSnapshot: suppliedFocusSnapshot = null,
+  } = {}) {
     if (working || !isHomePage() || (!force && !settings.enabled)) return false;
     if (isDesiredState(settings)) return true;
+    if (shouldPauseForUserInput({ allowFocusedComposer })) {
+      if (!quiet) showToast(text.deferred);
+      return false;
+    }
 
+    const focusSnapshot = suppliedFocusSnapshot || captureComposerFocus();
     working = true;
     try {
       const button = await waitFor(modeButton);
       if (!button || !isHomePage()) return false;
+      if (shouldPauseForUserInput({ allowFocusedComposer }) || visibleMenuItems().length) return false;
 
       // Always select the base model first. This clears an old thinking mode and
       // prevents “extended thinking” from attaching to the wrong model family.
       const models = await openModeMenu();
+      if (shouldPauseForUserInput({ allowFocusedComposer }) || userEditedAfter(focusSnapshot)) {
+        await closeModeMenu(captureComposerFocus() || focusSnapshot);
+        return false;
+      }
       const target = desiredModel(models, settings);
       if (!target?.element) {
         await closeModeMenu();
@@ -268,7 +391,12 @@
         return false;
       }
 
+      if (shouldPauseForUserInput({ allowFocusedComposer }) || userEditedAfter(focusSnapshot)) {
+        await closeModeMenu(captureComposerFocus() || focusSnapshot);
+        return false;
+      }
       target.element.click();
+      restoreComposerFocus(focusSnapshot);
       const modelSelected = await waitFor(() => {
         const updated = modeButton();
         return updated && currentMatchesModel(settings, updated) && updated;
@@ -277,9 +405,15 @@
         if (!quiet) showToast(text.unavailable, true);
         return false;
       }
+      if ((!allowFocusedComposer && shouldPauseForUserInput()) || userEditedAfter(focusSnapshot)) return false;
 
       if (settings.thinking === 'extended') {
+        if ((!allowFocusedComposer && shouldPauseForUserInput()) || userEditedAfter(focusSnapshot)) return false;
         await openModeMenu();
+        if (shouldPauseForUserInput({ allowFocusedComposer }) || userEditedAfter(focusSnapshot)) {
+          await closeModeMenu(captureComposerFocus() || focusSnapshot);
+          return false;
+        }
         const thinkingItem = thinkingMenuItem();
         if (!thinkingItem) {
           await closeModeMenu();
@@ -287,6 +421,7 @@
           return false;
         }
         thinkingItem.click();
+        restoreComposerFocus(focusSnapshot);
       }
 
       const applied = await waitFor(() => isDesiredState(settings), 5000);
@@ -295,6 +430,56 @@
     } finally {
       working = false;
     }
+  }
+
+  function promptSubmitKey(event) {
+    return event.key === 'Enter' &&
+      !event.shiftKey && !event.ctrlKey && !event.altKey && !event.metaKey &&
+      !event.isComposing && !event.repeat;
+  }
+
+  function shouldInterceptSubmit() {
+    return isHomePage() && settings.enabled && !userSelectedModel &&
+      Boolean(modeButton()) && !isDesiredState(settings) && Boolean(sendButton());
+  }
+
+  async function continueSubmit(originalButton, focusSnapshot) {
+    let applied = false;
+    try {
+      applied = await applyDefaults({
+        force: true,
+        quiet: true,
+        allowFocusedComposer: true,
+        focusSnapshot,
+      });
+    } catch (error) {
+      console.warn(`[${SCRIPT_ID}] submit-time model selection failed`, error);
+    }
+
+    restoreComposerFocus(focusSnapshot);
+    const button = await waitFor(() => {
+      return sendButton() || (originalButton?.isConnected ? originalButton : null);
+    }, 2500);
+    if (!button) {
+      showToast(text.submitFallback, true);
+      submitting = false;
+      return;
+    }
+    if (!applied && !isDesiredState(settings)) showToast(text.submitFallback, true);
+
+    replayingSubmit = true;
+    button.click();
+    setTimeout(() => { replayingSubmit = false; }, 0);
+    submitting = false;
+  }
+
+  function interceptSubmit(event, originalButton = sendButton()) {
+    if (replayingSubmit || submitting || !originalButton || !shouldInterceptSubmit()) return;
+    const focusSnapshot = captureComposerFocus();
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    submitting = true;
+    void continueSubmit(originalButton, focusSnapshot);
   }
 
   function mergedModelChoices(liveModels) {
@@ -358,6 +543,8 @@
     closeSettings();
     showToast(text.saved);
     lastAppliedNavigationId = 0;
+    lastAttemptNavigationId = 0;
+    pendingAutoApply = false;
     if (isHomePage()) await applyDefaults({ force: true });
   }
 
@@ -496,17 +683,35 @@
   async function autoApply() {
     ensureUi();
     if (!isHomePage() || !settings.enabled || lastAppliedNavigationId === navigationId) return;
-    lastAppliedNavigationId = navigationId;
-    await applyDefaults({ quiet: true });
+    if (userSelectedModel || visibleMenuItems().length) return;
+    if (activeComposer()) {
+      pendingAutoApply = true;
+      return;
+    }
+    if (inputRecentlyUsed()) {
+      pendingAutoApply = true;
+      scheduleAutoApply(INPUT_IDLE_DELAY - (Date.now() - lastUserInputAt) + 80);
+      return;
+    }
+    if (lastAttemptNavigationId === navigationId && !pendingAutoApply) return;
+
+    pendingAutoApply = false;
+    lastAttemptNavigationId = navigationId;
+    const applied = await applyDefaults({ quiet: true });
+    if (applied) lastAppliedNavigationId = navigationId;
   }
 
-  function scheduleAutoApply() {
+  function scheduleAutoApply(delay = 500) {
     clearTimeout(scheduleTimer);
-    scheduleTimer = setTimeout(autoApply, 500);
+    scheduleTimer = setTimeout(autoApply, delay);
   }
 
   function navigationChanged() {
     navigationId += 1;
+    lastAttemptNavigationId = 0;
+    lastAppliedNavigationId = 0;
+    pendingAutoApply = false;
+    userSelectedModel = false;
     scheduleAutoApply();
   }
 
@@ -520,6 +725,37 @@
   }
 
   addEventListener('popstate', navigationChanged);
+  document.addEventListener('input', (event) => {
+    if (composerElement(event.target)) {
+      lastUserInputAt = Date.now();
+      pendingAutoApply = true;
+    }
+  }, true);
+  document.addEventListener('keydown', (event) => {
+    if (composerElement(event.target) && !event.metaKey && !event.ctrlKey && !event.altKey) {
+      lastUserInputAt = Date.now();
+      pendingAutoApply = true;
+    }
+  }, true);
+  document.addEventListener('keydown', (event) => {
+    if (composerElement(event.target) && promptSubmitKey(event)) interceptSubmit(event);
+  }, true);
+  document.addEventListener('click', (event) => {
+    const target = event.target instanceof Element ? event.target.closest(SEND_BUTTON_SELECTOR) : null;
+    if (target && isVisible(target)) interceptSubmit(event, target);
+  }, true);
+  document.addEventListener('pointerdown', (event) => {
+    if (event.isTrusted && modeControlElement(event.target)) {
+      userSelectedModel = true;
+      pendingAutoApply = false;
+    }
+  }, true);
+  document.addEventListener('focusout', (event) => {
+    if (composerElement(event.target) && !modeControlElement(event.relatedTarget)) {
+      pendingAutoApply = true;
+      scheduleAutoApply(INPUT_IDLE_DELAY + 100);
+    }
+  }, true);
   new MutationObserver(() => {
     ensureUi();
     scheduleAutoApply();

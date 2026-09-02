@@ -12,6 +12,8 @@ A lightweight Tampermonkey/Violentmonkey userscript that automatically selects y
 - Defaults to **Flash + extended thinking**.
 - Supports both `gemini.google.com/app` and multi-account URLs such as `gemini.google.com/u/0/app`.
 - Applies only on the new-chat home page and does not force a model change in existing conversations.
+- Pauses while the editor is focused or the user is typing, so the model menu cannot steal the caret; it resumes after the editor is left.
+- If the user presses Enter or clicks Send while the editor remains focused, it checks the defaults first and then continues the original submission.
 - Stores preferences locally in the userscript manager and sends nothing to an external server.
 
 ## Installation
@@ -28,6 +30,12 @@ You can open settings in either of these ways:
 - Open your userscript manager menu and choose **Configure Gemini default model**.
 
 Choose a model and thinking intensity, then click **Save and apply now**. The model list is read dynamically from Gemini, so model version changes generally do not require a userscript update.
+
+## Focus protection
+
+Gemini often loads its editor before the model selector. The userscript recognizes the `contenteditable` editor, recent keyboard input, and a model menu opened by the user. It does not open the model menu while you are typing or overwrite a manual model choice; it resumes applying the defaults after you leave the editor.
+
+When a prompt is submitted before the defaults are ready, the userscript briefly intercepts that submission, selects the configured model, and then triggers Gemini's Send button. It does not intercept a submission when the desired model is already selected; if a configured model is temporarily unavailable, it continues with the current model so the prompt is not lost.
 
 ## About “thinking intensity”
 
