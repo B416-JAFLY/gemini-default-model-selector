@@ -2,7 +2,7 @@
 // @name         Gemini Default Model Selector
 // @name:zh-CN   Gemini 默认模型选择器
 // @namespace    https://github.com/B416-JAFLY/gemini-default-model-selector
-// @version      0.3.0
+// @version      0.3.1
 // @description  Automatically select your preferred Gemini model and thinking level for every new chat.
 // @description:zh-CN 为 Gemini 新对话自动选择默认模型与思考等级，并提供随时可修改的设置面板。
 // @author       B416-JAFLY
@@ -23,6 +23,7 @@
   const SCRIPT_ID = 'gemini-default-model-selector';
   const SETTINGS_KEY = 'settings-v1';
   const MODEL_CACHE_KEY = 'model-cache-v1';
+  const POSITION_KEY = 'launcher-position-v1';
   const HOME_PATH = /^(?:\/u\/[^/]+)?\/app\/?$/;
   const MODE_BUTTON_SELECTOR = [
     'button[data-test-id="bard-mode-menu-button"]',
@@ -65,7 +66,7 @@
 
   const text = isChinese ? {
     button: '默认模型',
-    buttonTitle: '设置 Gemini 默认模型',
+    buttonTitle: '设置 Gemini 默认模型（可拖动调整位置）',
     title: 'Gemini 默认模型选择器',
     subtitle: '设置会保存在油猴中，并在每次进入新对话首页时自动应用。',
     enabled: '自动应用默认设置',
@@ -89,7 +90,7 @@
     submitFallback: '默认模型暂未就绪，已按当前模型继续发送。',
   } : {
     button: 'Default model',
-    buttonTitle: 'Configure Gemini default model',
+    buttonTitle: 'Configure Gemini default model (drag to move)',
     title: 'Gemini Default Model Selector',
     subtitle: 'Settings are stored by your userscript manager and applied on every new-chat home page.',
     enabled: 'Automatically apply defaults',
@@ -238,6 +239,15 @@
     return composerElement(document.activeElement);
   }
 
+  function composerHasContent() {
+    const element = activeComposer() || document.querySelector(COMPOSER_SELECTOR);
+    if (!element) return false;
+    const text = (element.value || element.textContent || '')
+      .replace(/[\u200B-\u200D\uFEFF]/g, '')
+      .trim();
+    return text.length > 0;
+  }
+
   function modeControlElement(element) {
     if (!(element instanceof Element)) return null;
     return element.closest(
@@ -292,13 +302,11 @@
   }
 
   function shouldPauseForUserInput({ allowFocusedComposer = false } = {}) {
-    if (!allowFocusedComposer && activeComposer()) {
+    if (inputRecentlyUsed() || (!allowFocusedComposer && composerHasContent())) {
       pendingAutoApply = true;
-      return true;
-    }
-    if (!allowFocusedComposer && inputRecentlyUsed()) {
-      pendingAutoApply = true;
-      scheduleAutoApply(INPUT_IDLE_DELAY - (Date.now() - lastUserInputAt) + 80);
+      if (inputRecentlyUsed()) {
+        scheduleAutoApply(INPUT_IDLE_DELAY - (Date.now() - lastUserInputAt) + 80);
+      }
       return true;
     }
     return false;
@@ -550,7 +558,7 @@
           if (!quiet) showToast(text.unavailable, true);
           return false;
         }
-        await sleep(200);
+        await sleep(150);
       }
 
       // Check and apply thinking level
@@ -568,6 +576,7 @@
 
       const applied = await waitFor(() => isDesiredState(settings), 5000);
       if (applied && !quiet) showToast(text.applied);
+      restoreComposerFocus(focusSnapshot);
       return Boolean(applied);
     } finally {
       working = false;
@@ -599,9 +608,12 @@
     }
 
     restoreComposerFocus(focusSnapshot);
+    await sleep(60);
+
     const button = await waitFor(() => {
       return sendButton() || (originalButton?.isConnected ? originalButton : null);
-    }, 2500);
+    }, 3000);
+
     if (!button) {
       showToast(text.submitFallback, true);
       submitting = false;
@@ -610,9 +622,38 @@
     if (!applied && !isDesiredState(settings)) showToast(text.submitFallback, true);
 
     replayingSubmit = true;
-    button.click();
-    setTimeout(() => { replayingSubmit = false; }, 0);
-    submitting = false;
+    try {
+      // 1. Dispatch full pointer event sequence for Angular MDC Send button
+      const rect = button.getBoundingClientRect();
+      const clientX = rect.left + rect.width / 2;
+      const clientY = rect.top + rect.height / 2;
+      const opts = { bubbles: true, cancelable: true, view: window, clientX, clientY };
+      button.dispatchEvent(new PointerEvent('pointerdown', opts));
+      button.dispatchEvent(new MouseEvent('mousedown', opts));
+      button.dispatchEvent(new PointerEvent('pointerup', opts));
+      button.dispatchEvent(new MouseEvent('mouseup', opts));
+      button.click();
+
+      // 2. Also simulate Enter key on the composer if still focused
+      const composer = focusSnapshot?.element || activeComposer();
+      if (composer && isVisible(composer)) {
+        const keyOpts = {
+          key: 'Enter',
+          code: 'Enter',
+          keyCode: 13,
+          which: 13,
+          bubbles: true,
+          cancelable: true,
+        };
+        composer.dispatchEvent(new KeyboardEvent('keydown', keyOpts));
+        composer.dispatchEvent(new KeyboardEvent('keyup', keyOpts));
+      }
+    } finally {
+      setTimeout(() => {
+        replayingSubmit = false;
+        submitting = false;
+      }, 150);
+    }
   }
 
   function interceptSubmit(event, originalButton = sendButton()) {
@@ -687,7 +728,7 @@
     lastAppliedNavigationId = 0;
     lastAttemptNavigationId = 0;
     pendingAutoApply = false;
-    if (isHomePage()) await applyDefaults({ force: true });
+    if (isHomePage()) await applyDefaults({ force: true, allowFocusedComposer: true });
   }
 
   function handleReset() {
@@ -708,6 +749,120 @@
     ui.toastTimer = setTimeout(() => { toast.hidden = true; }, 3200);
   }
 
+  function getSavedLauncherPosition() {
+    try {
+      const pos = GM_getValue(POSITION_KEY, null);
+      if (pos && typeof pos.left === 'number' && typeof pos.top === 'number') {
+        const maxLeft = Math.max(10, window.innerWidth - 130);
+        const maxTop = Math.max(10, window.innerHeight - 45);
+        return {
+          left: Math.min(Math.max(8, pos.left), maxLeft),
+          top: Math.min(Math.max(8, pos.top), maxTop),
+        };
+      }
+    } catch {}
+    return null;
+  }
+
+  function makeLauncherDraggable(launcher) {
+    let isPointerDown = false;
+    let isDragging = false;
+    let startX = 0;
+    let startY = 0;
+    let initialLeft = 0;
+    let initialTop = 0;
+    const dragThreshold = 5;
+
+    const savedPos = getSavedLauncherPosition();
+    if (savedPos) {
+      launcher.style.left = `${savedPos.left}px`;
+      launcher.style.top = `${savedPos.top}px`;
+      launcher.style.right = 'auto';
+      launcher.style.bottom = 'auto';
+    }
+
+    launcher.addEventListener('pointerdown', (e) => {
+      if (e.button !== 0) return;
+      isPointerDown = true;
+      isDragging = false;
+      startX = e.clientX;
+      startY = e.clientY;
+      const rect = launcher.getBoundingClientRect();
+      initialLeft = rect.left;
+      initialTop = rect.top;
+      try {
+        launcher.setPointerCapture(e.pointerId);
+      } catch {}
+    });
+
+    launcher.addEventListener('pointermove', (e) => {
+      if (!isPointerDown) return;
+      const dx = e.clientX - startX;
+      const dy = e.clientY - startY;
+      if (!isDragging && Math.hypot(dx, dy) > dragThreshold) {
+        isDragging = true;
+        launcher.classList.add('dragging');
+      }
+      if (isDragging) {
+        let nextLeft = initialLeft + dx;
+        let nextTop = initialTop + dy;
+        const maxLeft = window.innerWidth - launcher.offsetWidth - 8;
+        const maxTop = window.innerHeight - launcher.offsetHeight - 8;
+        nextLeft = Math.min(Math.max(8, nextLeft), maxLeft);
+        nextTop = Math.min(Math.max(8, nextTop), maxTop);
+        launcher.style.left = `${nextLeft}px`;
+        launcher.style.top = `${nextTop}px`;
+        launcher.style.right = 'auto';
+        launcher.style.bottom = 'auto';
+      }
+    });
+
+    const stopDrag = (e) => {
+      if (!isPointerDown) return;
+      isPointerDown = false;
+      try {
+        launcher.releasePointerCapture(e.pointerId);
+      } catch {}
+
+      if (isDragging) {
+        launcher.classList.remove('dragging');
+        const rect = launcher.getBoundingClientRect();
+        GM_setValue(POSITION_KEY, { left: Math.round(rect.left), top: Math.round(rect.top) });
+        launcher.dataset.dragEndedAt = String(Date.now());
+        setTimeout(() => {
+          isDragging = false;
+        }, 50);
+      }
+    };
+
+    launcher.addEventListener('pointerup', stopDrag);
+    launcher.addEventListener('pointercancel', stopDrag);
+
+    launcher.addEventListener('click', (e) => {
+      const dragEndedAt = Number(launcher.dataset.dragEndedAt || 0);
+      if (isDragging || (dragEndedAt && Date.now() - dragEndedAt < 250)) {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        return false;
+      }
+    }, true);
+
+    window.addEventListener('resize', () => {
+      const rect = launcher.getBoundingClientRect();
+      const maxLeft = window.innerWidth - launcher.offsetWidth - 8;
+      const maxTop = window.innerHeight - launcher.offsetHeight - 8;
+      if (rect.left > maxLeft || rect.top > maxTop) {
+        const newLeft = Math.min(Math.max(8, rect.left), maxLeft);
+        const newTop = Math.min(Math.max(8, rect.top), maxTop);
+        launcher.style.left = `${newLeft}px`;
+        launcher.style.top = `${newTop}px`;
+        launcher.style.right = 'auto';
+        launcher.style.bottom = 'auto';
+        GM_setValue(POSITION_KEY, { left: Math.round(newLeft), top: Math.round(newTop) });
+      }
+    });
+  }
+
   function ensureUi() {
     if (ui?.host?.isConnected) return;
 
@@ -721,14 +876,26 @@
         button, select, input { font: inherit; }
         .launcher {
           position: fixed; right: 18px; bottom: 92px; z-index: 2147483645;
-          display: flex; align-items: center; gap: 7px; padding: 10px 13px;
+          display: flex; align-items: center; gap: 7px; padding: 10px 14px;
           border: 1px solid color-mix(in srgb, #7cacf8 42%, transparent);
           border-radius: 999px; color: #eaf2ff; background: rgba(31, 36, 48, .92);
-          box-shadow: 0 8px 28px rgba(0, 0, 0, .26); cursor: pointer;
+          box-shadow: 0 8px 28px rgba(0, 0, 0, .26); cursor: grab;
           font: 600 13px/1.1 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-          backdrop-filter: blur(12px); transition: transform .15s ease, background .15s ease;
+          backdrop-filter: blur(12px);
+          user-select: none; -webkit-user-select: none;
+          touch-action: none;
+          transition: background .15s ease, box-shadow .15s ease, border-color .15s ease;
         }
-        .launcher:hover { transform: translateY(-1px); background: rgba(44, 52, 68, .97); }
+        .launcher:hover {
+          background: rgba(44, 52, 68, .97);
+          box-shadow: 0 10px 32px rgba(0, 0, 0, .32);
+        }
+        .launcher.dragging {
+          cursor: grabbing !important;
+          transform: scale(1.04);
+          box-shadow: 0 14px 38px rgba(0, 0, 0, .45);
+          opacity: 0.95;
+        }
         .launcher:focus-visible, .btn:focus-visible, select:focus-visible, input:focus-visible {
           outline: 3px solid rgba(138, 180, 248, .48); outline-offset: 2px;
         }
@@ -778,7 +945,6 @@
           .toast { color: #202124; background: #fff; }
         }
         @media (max-width: 560px) {
-          .launcher { right: 12px; bottom: 82px; }
           .launcher span { display: none; }
           .dialog { padding: 20px; }
         }
@@ -811,7 +977,9 @@
 
     document.body.append(host);
     ui = { host, shadow, toastTimer: 0 };
-    shadow.querySelector('[data-open]').addEventListener('click', openSettings);
+    const launcher = shadow.querySelector('[data-open]');
+    makeLauncherDraggable(launcher);
+    launcher.addEventListener('click', openSettings);
     shadow.querySelector('[data-cancel]').addEventListener('click', closeSettings);
     shadow.querySelector('[data-save]').addEventListener('click', handleSave);
     shadow.querySelector('[data-reset]').addEventListener('click', handleReset);
@@ -827,24 +995,25 @@
     ensureUi();
     if (!isHomePage() || !settings.enabled || lastAppliedNavigationId === navigationId) return;
     if (userSelectedModel || visibleMenuItems().length) return;
-    if (activeComposer()) {
+
+    // Only pause if user is actually typing or already wrote prompt content
+    if (inputRecentlyUsed() || composerHasContent()) {
       pendingAutoApply = true;
+      if (inputRecentlyUsed()) {
+        scheduleAutoApply(INPUT_IDLE_DELAY - (Date.now() - lastUserInputAt) + 80);
+      }
       return;
     }
-    if (inputRecentlyUsed()) {
-      pendingAutoApply = true;
-      scheduleAutoApply(INPUT_IDLE_DELAY - (Date.now() - lastUserInputAt) + 80);
-      return;
-    }
+
     if (lastAttemptNavigationId === navigationId && !pendingAutoApply) return;
 
     pendingAutoApply = false;
     lastAttemptNavigationId = navigationId;
-    const applied = await applyDefaults({ quiet: true });
+    const applied = await applyDefaults({ quiet: true, allowFocusedComposer: true });
     if (applied) lastAppliedNavigationId = navigationId;
   }
 
-  function scheduleAutoApply(delay = 500) {
+  function scheduleAutoApply(delay = 200) {
     clearTimeout(scheduleTimer);
     scheduleTimer = setTimeout(autoApply, delay);
   }
@@ -855,7 +1024,7 @@
     lastAppliedNavigationId = 0;
     pendingAutoApply = false;
     userSelectedModel = false;
-    scheduleAutoApply();
+    scheduleAutoApply(150);
   }
 
   for (const method of ['pushState', 'replaceState']) {
@@ -895,8 +1064,9 @@
   }, true);
   document.addEventListener('focusout', (event) => {
     if (composerElement(event.target) && !modeControlElement(event.relatedTarget)) {
-      pendingAutoApply = true;
-      scheduleAutoApply(INPUT_IDLE_DELAY + 100);
+      if (!composerHasContent()) {
+        scheduleAutoApply(150);
+      }
     }
   }, true);
   new MutationObserver(() => {
