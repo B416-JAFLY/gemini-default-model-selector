@@ -2,14 +2,15 @@
 
 [中文](README.md)
 
-A lightweight Tampermonkey/Violentmonkey userscript that automatically selects your preferred Gemini model and thinking intensity whenever you enter the new-chat home page.
+A lightweight Tampermonkey/Violentmonkey userscript that automatically selects your preferred Gemini model and thinking level whenever you enter the new-chat home page.
 
 ## Features
 
 - Reads the model list currently displayed by Gemini instead of relying on fixed version numbers.
-- Supports Flash-Lite, Flash, Pro, and other models that Gemini may expose later.
-- Lets you choose between standard model-default thinking and extended thinking.
-- Defaults to **Flash + extended thinking**.
+- Supports 3.5 Flash-Lite, 3.8 Flash, 3.1 Pro, 4 Argon, and other models that Gemini may expose later.
+- Full support for the new 3-tier thinking levels: **Low (fast & efficient)**, **Medium (balanced)**, and **High (comprehensive)**.
+- Defaults to **3.8 Flash + High thinking level**.
+- Compatible with Gemini's strict **Trusted Types (CSP)** policy.
 - Supports both `gemini.google.com/app` and multi-account URLs such as `gemini.google.com/u/0/app`.
 - Applies only on the new-chat home page and does not force a model change in existing conversations.
 - Pauses while the editor is focused or the user is typing, so the model menu cannot steal the caret; it resumes after the editor is left.
@@ -18,7 +19,7 @@ A lightweight Tampermonkey/Violentmonkey userscript that automatically selects y
 
 ## Installation
 
-1. Install [Tampermonkey](https://www.tampermonkey.net/) or [Violentmonkey](https://violentmonkey.github.io/).
+1. Install [Tampermonkey](https://www.tampermonkey.net/) or [Violentmonkey](https://violentmonkey.github.io/) .
 2. [Click here to install the userscript](https://raw.githubusercontent.com/B416-JAFLY/gemini-default-model-selector/main/gemini-default-model-selector.user.js).
 3. Open Gemini. Your defaults will be applied on the new-chat page.
 
@@ -29,7 +30,7 @@ You can open settings in either of these ways:
 - Click the **Default model** floating button in the lower-right corner of Gemini.
 - Open your userscript manager menu and choose **Configure Gemini default model**.
 
-Choose a model and thinking intensity, then click **Save and apply now**. The model list is read dynamically from Gemini, so model version changes generally do not require a userscript update.
+Choose a model and thinking level, then click **Save and apply now**. The model list is read dynamically from Gemini, so model version changes generally do not require a userscript update.
 
 ## Focus protection
 
@@ -37,9 +38,9 @@ Gemini often loads its editor before the model selector. The userscript recogniz
 
 When a prompt is submitted before the defaults are ready, the userscript briefly intercepts that submission, selects the configured model, and then triggers Gemini's Send button. It does not intercept a submission when the desired model is already selected; if a configured model is temporarily unavailable, it continues with the current model so the prompt is not lost.
 
-## About “thinking intensity”
+## About “Thinking Level”
 
-The Gemini web interface currently exposes two directly selectable states: the model default and extended thinking. The userscript mirrors those real options. If Google adds low, medium, or high levels later, the project can extend the setting in a future release.
+The Gemini web interface has transitioned from binary extended thinking to a 3-tier submenu (Low, Medium, High). This userscript fully supports discovering, expanding, and selecting these submenu options seamlessly.
 
 ## Development and checks
 

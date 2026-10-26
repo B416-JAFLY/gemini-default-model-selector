@@ -2,9 +2,9 @@
 // @name         Gemini Default Model Selector
 // @name:zh-CN   Gemini 默认模型选择器
 // @namespace    https://github.com/B416-JAFLY/gemini-default-model-selector
-// @version      0.2.1
-// @description  Automatically select your preferred Gemini model and thinking mode for every new chat.
-// @description:zh-CN 为 Gemini 新对话自动选择默认模型与思考强度，并提供随时可修改的设置面板。
+// @version      0.3.0
+// @description  Automatically select your preferred Gemini model and thinking level for every new chat.
+// @description:zh-CN 为 Gemini 新对话自动选择默认模型与思考等级，并提供随时可修改的设置面板。
 // @author       B416-JAFLY
 // @license      MIT
 // @match        https://gemini.google.com/app*
@@ -24,9 +24,14 @@
   const SETTINGS_KEY = 'settings-v1';
   const MODEL_CACHE_KEY = 'model-cache-v1';
   const HOME_PATH = /^(?:\/u\/[^/]+)?\/app\/?$/;
-  const MODE_BUTTON_SELECTOR =
-    'button[aria-label*="模式选择器"], button[aria-label*="mode selector" i]';
-  const THINKING_PATTERN = /^(扩展思考|Extended thinking)$/i;
+  const MODE_BUTTON_SELECTOR = [
+    'button[data-test-id="bard-mode-menu-button"]',
+    'button.input-area-switch',
+    'button[aria-label*="模式选择器"]',
+    'button[aria-label*="mode selector" i]',
+  ].join(',');
+  const THINKING_ITEM_VALUE = 'thinking_level';
+  const THINKING_ITEM_PATTERN = /^(思考等级|thinking(\s+level)?)$/i;
   const SEND_BUTTON_SELECTOR = [
     'button[aria-label*="发送"]',
     'button[aria-label*="Send" i]',
@@ -44,13 +49,14 @@
   const DEFAULT_SETTINGS = Object.freeze({
     enabled: true,
     modelKey: 'flash',
-    modelLabel: 'Flash',
-    thinking: 'extended',
+    modelLabel: '3.8 Flash',
+    thinking: 'high',
   });
   const FALLBACK_MODELS = [
-    { key: 'flash-lite', label: 'Flash-Lite' },
-    { key: 'flash', label: 'Flash' },
-    { key: 'pro', label: 'Pro' },
+    { key: 'flash-lite', label: '3.5 Flash-Lite' },
+    { key: 'flash', label: '3.8 Flash' },
+    { key: 'pro', label: '3.1 Pro' },
+    { key: 'argon', label: '4 Argon' },
   ];
 
   const isChinese = (document.documentElement.lang || navigator.language || '')
@@ -64,9 +70,10 @@
     subtitle: '设置会保存在油猴中，并在每次进入新对话首页时自动应用。',
     enabled: '自动应用默认设置',
     model: '默认模型',
-    thinking: '思考强度',
-    standard: '标准（使用模型默认）',
-    extended: '扩展思考',
+    thinking: '思考等级',
+    thinkingLow: '低（快速高效）',
+    thinkingMedium: '中（深度适中）',
+    thinkingHigh: '高（超级详尽）',
     loading: '正在读取 Gemini 当前可用模型…',
     liveModels: '已读取当前可用模型。',
     fallbackModels: '暂时无法读取模型菜单，显示缓存或通用选项。',
@@ -76,8 +83,8 @@
     saved: '默认设置已保存',
     applied: '已应用默认模型设置',
     unavailable: '找不到所选模型，请重新打开设置并选择当前可用模型。',
-    thinkingUnavailable: '当前模型没有可用的“扩展思考”选项。',
-    resetDone: '已恢复为 Flash + 扩展思考',
+    thinkingUnavailable: '未能设置所选思考等级，可能该模型不支持或菜单未响应。',
+    resetDone: '已恢复为 3.8 Flash + 高思考等级',
     deferred: '检测到输入框正在使用，模型切换会在你完成输入后进行。',
     submitFallback: '默认模型暂未就绪，已按当前模型继续发送。',
   } : {
@@ -87,9 +94,10 @@
     subtitle: 'Settings are stored by your userscript manager and applied on every new-chat home page.',
     enabled: 'Automatically apply defaults',
     model: 'Default model',
-    thinking: 'Thinking intensity',
-    standard: 'Standard (model default)',
-    extended: 'Extended thinking',
+    thinking: 'Thinking level',
+    thinkingLow: 'Low (fast & efficient)',
+    thinkingMedium: 'Medium (balanced)',
+    thinkingHigh: 'High (comprehensive)',
     loading: 'Reading currently available Gemini models…',
     liveModels: 'Current models loaded.',
     fallbackModels: 'Could not read the model menu; showing cached or generic choices.',
@@ -99,11 +107,49 @@
     saved: 'Default settings saved',
     applied: 'Default model settings applied',
     unavailable: 'The selected model is unavailable. Open settings and choose a current model.',
-    thinkingUnavailable: 'Extended thinking is unavailable for this model.',
-    resetDone: 'Reset to Flash + extended thinking',
+    thinkingUnavailable: 'The selected thinking level could not be applied.',
+    resetDone: 'Reset to 3.8 Flash + High thinking level',
     deferred: 'The editor is in use. Model switching will resume after you finish typing.',
     submitFallback: 'The default model was not ready, so the prompt was sent with the current model.',
   };
+
+  let gmdmsPolicy = null;
+  function getTrustedPolicy() {
+    if (gmdmsPolicy) return gmdmsPolicy;
+    const tt = window.trustedTypes || (typeof unsafeWindow !== 'undefined' && unsafeWindow.trustedTypes);
+    if (tt?.createPolicy) {
+      try {
+        gmdmsPolicy = tt.createPolicy('gmdms-policy', {
+          createHTML: (s) => s,
+        });
+      } catch {
+        try {
+          gmdmsPolicy = tt.createPolicy('gmdms-policy-' + Date.now(), {
+            createHTML: (s) => s,
+          });
+        } catch {
+          gmdmsPolicy = tt.defaultPolicy || null;
+        }
+      }
+    }
+    return gmdmsPolicy;
+  }
+
+  function setSafeHTML(element, html) {
+    const policy = getTrustedPolicy();
+    if (policy) {
+      element.innerHTML = policy.createHTML(html);
+    } else {
+      element.innerHTML = html;
+    }
+  }
+
+  function normalizeThinking(val) {
+    if (val === 'extended') return 'high';
+    if (val === 'standard') return 'low';
+    if (val === 'high' || val === 'medium' || val === 'low') return val;
+    return 'high';
+  }
 
   let settings = loadSettings();
   let ui = null;
@@ -122,11 +168,14 @@
 
   function loadSettings() {
     const saved = GM_getValue(SETTINGS_KEY, {});
-    return { ...DEFAULT_SETTINGS, ...(saved && typeof saved === 'object' ? saved : {}) };
+    const merged = { ...DEFAULT_SETTINGS, ...(saved && typeof saved === 'object' ? saved : {}) };
+    merged.thinking = normalizeThinking(merged.thinking);
+    return merged;
   }
 
   function saveSettings(next) {
     settings = { ...DEFAULT_SETTINGS, ...next };
+    settings.thinking = normalizeThinking(settings.thinking);
     GM_setValue(SETTINGS_KEY, settings);
   }
 
@@ -161,6 +210,7 @@
 
   function modelKeyFromLabel(label, modeId = '') {
     const normalized = normalize(label).toLowerCase();
+    if (/argon/.test(normalized)) return 'argon';
     if (/flash[\s-]*lite/.test(normalized)) return 'flash-lite';
     if (/(^|\s)flash($|\s)/.test(normalized)) return 'flash';
     if (/(^|\s)pro($|\s)/.test(normalized)) return 'pro';
@@ -191,7 +241,7 @@
   function modeControlElement(element) {
     if (!(element instanceof Element)) return null;
     return element.closest(
-      `${MODE_BUTTON_SELECTOR}, [role="menu"], [role="menuitem"]`,
+      `${MODE_BUTTON_SELECTOR}, [role="menu"], [role="menuitem"], gem-menu, gem-menu-item`,
     );
   }
 
@@ -255,7 +305,10 @@
   }
 
   function currentModeText(button = modeButton()) {
-    return normalize(`${button?.getAttribute('aria-label') || ''} ${button?.textContent || ''}`);
+    if (!button) return '';
+    const primary = button.querySelector('.picker-primary-text')?.textContent;
+    if (primary) return normalize(primary);
+    return normalize(`${button.getAttribute('aria-label') || ''} ${button.textContent || ''}`);
   }
 
   function currentModelKey(button = modeButton()) {
@@ -263,7 +316,16 @@
   }
 
   function currentThinkingMode(button = modeButton()) {
-    return /(扩展|Extended)/i.test(currentModeText(button)) ? 'extended' : 'standard';
+    if (!button) return 'low';
+    const secondary = button.querySelector('.picker-secondary-text')?.textContent?.trim().toLowerCase() || '';
+    const fullText = normalize(`${button.getAttribute('aria-label') || ''} ${button.textContent || ''}`).toLowerCase();
+    if (secondary.includes('高') || /high/i.test(secondary) || fullText.includes('高') || /\bhigh\b/i.test(fullText)) {
+      return 'high';
+    }
+    if (secondary.includes('中') || /medium|mid/i.test(secondary) || fullText.includes('中') || /\bmedium\b/i.test(fullText)) {
+      return 'medium';
+    }
+    return 'low';
   }
 
   function currentMatchesModel(preferredSettings, button = modeButton()) {
@@ -286,9 +348,15 @@
     return [...document.querySelectorAll('[role="menuitem"]')].filter(isVisible);
   }
 
+  function isThinkingMenuItem(item) {
+    if (item.getAttribute('value') === THINKING_ITEM_VALUE) return true;
+    const label = menuItemLabel(item);
+    return THINKING_ITEM_PATTERN.test(label);
+  }
+
   function readVisibleModels() {
     return visibleMenuItems()
-      .filter((item) => !THINKING_PATTERN.test(menuItemLabel(item)))
+      .filter((item) => !isThinkingMenuItem(item))
       .map((element) => {
         const label = menuItemLabel(element);
         const modeId = element.getAttribute('data-mode-id') || '';
@@ -302,8 +370,79 @@
       });
   }
 
-  function thinkingMenuItem() {
-    return visibleMenuItems().find((item) => THINKING_PATTERN.test(menuItemLabel(item))) || null;
+  function thinkingMenuTrigger() {
+    return (
+      document.querySelector(`gem-menu-item[value="${THINKING_ITEM_VALUE}"], [role="menuitem"][value="${THINKING_ITEM_VALUE}"]`) ||
+      visibleMenuItems().find((item) => THINKING_ITEM_PATTERN.test(menuItemLabel(item))) ||
+      null
+    );
+  }
+
+  function thinkingLevelFromItem(item) {
+    const label = menuItemLabel(item).toLowerCase();
+    const sublabel = menuItemSublabel(item).toLowerCase();
+    const combined = `${label} ${sublabel}`;
+    if (label === '高' || /high|详尽|comprehensive/i.test(combined)) return 'high';
+    if (label === '中' || /medium|适中|balanced/i.test(combined)) return 'medium';
+    if (label === '低' || /low|高效|快速|fast/i.test(combined)) return 'low';
+    return null;
+  }
+
+  async function openThinkingSubmenu() {
+    const trigger = thinkingMenuTrigger();
+    if (!trigger) return [];
+
+    const controlsId = trigger.getAttribute('aria-controls');
+    if (controlsId) {
+      const existingMenu = document.getElementById(controlsId);
+      if (existingMenu && isVisible(existingMenu)) {
+        const items = [...existingMenu.querySelectorAll('[role="menuitem"]')].filter(isVisible);
+        if (items.length) return items;
+      }
+    }
+
+    trigger.dispatchEvent(new MouseEvent('mouseenter', { bubbles: true }));
+    trigger.click();
+
+    const items = await waitFor(() => {
+      let container = controlsId ? document.getElementById(controlsId) : null;
+      if (!container) {
+        const menus = [...document.querySelectorAll('gem-menu[role="menu"]')].filter(isVisible);
+        if (menus.length > 1) {
+          container = menus[menus.length - 1];
+        }
+      }
+      if (container) {
+        const menuItems = [...container.querySelectorAll('[role="menuitem"]')].filter(isVisible);
+        if (menuItems.length) return menuItems;
+      }
+      return null;
+    }, 3000);
+
+    return items || [];
+  }
+
+  async function selectThinkingLevel(targetLevel) {
+    if (currentThinkingMode() === targetLevel) return true;
+
+    const menu = await openModeMenu();
+    if (!menu.length) return false;
+
+    const trigger = thinkingMenuTrigger();
+    if (!trigger) {
+      await closeModeMenu();
+      return false;
+    }
+
+    const subItems = await openThinkingSubmenu();
+    const targetItem = subItems.find((item) => thinkingLevelFromItem(item) === targetLevel);
+    if (!targetItem) {
+      await closeModeMenu();
+      return false;
+    }
+
+    targetItem.click();
+    return true;
   }
 
   async function waitFor(getValue, timeout = 12000, interval = 150) {
@@ -334,6 +473,10 @@
     if (!visibleMenuItems().length) return;
     modeButton()?.click();
     await waitFor(() => !visibleMenuItems().length, 2000);
+    if (visibleMenuItems().length) {
+      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', bubbles: true }));
+      await waitFor(() => !visibleMenuItems().length, 1000);
+    }
     restoreComposerFocus(focusSnapshot);
   }
 
@@ -375,53 +518,52 @@
     try {
       const button = await waitFor(modeButton);
       if (!button || !isHomePage()) return false;
-      if (shouldPauseForUserInput({ allowFocusedComposer }) || visibleMenuItems().length) return false;
+      if (shouldPauseForUserInput({ allowFocusedComposer })) return false;
 
-      // Always select the base model first. This clears an old thinking mode and
-      // prevents “extended thinking” from attaching to the wrong model family.
-      const models = await openModeMenu();
-      if (shouldPauseForUserInput({ allowFocusedComposer }) || userEditedAfter(focusSnapshot)) {
-        await closeModeMenu(captureComposerFocus() || focusSnapshot);
-        return false;
-      }
-      const target = desiredModel(models, settings);
-      if (!target?.element) {
-        await closeModeMenu();
-        if (!quiet) showToast(text.unavailable, true);
-        return false;
-      }
-
-      if (shouldPauseForUserInput({ allowFocusedComposer }) || userEditedAfter(focusSnapshot)) {
-        await closeModeMenu(captureComposerFocus() || focusSnapshot);
-        return false;
-      }
-      target.element.click();
-      restoreComposerFocus(focusSnapshot);
-      const modelSelected = await waitFor(() => {
-        const updated = modeButton();
-        return updated && currentMatchesModel(settings, updated) && updated;
-      }, 5000);
-      if (!modelSelected) {
-        if (!quiet) showToast(text.unavailable, true);
-        return false;
-      }
-      if ((!allowFocusedComposer && shouldPauseForUserInput()) || userEditedAfter(focusSnapshot)) return false;
-
-      if (settings.thinking === 'extended') {
-        if ((!allowFocusedComposer && shouldPauseForUserInput()) || userEditedAfter(focusSnapshot)) return false;
-        await openModeMenu();
+      // Always select base model first if it does not match
+      if (!currentMatchesModel(settings, button)) {
+        const models = await openModeMenu();
         if (shouldPauseForUserInput({ allowFocusedComposer }) || userEditedAfter(focusSnapshot)) {
           await closeModeMenu(captureComposerFocus() || focusSnapshot);
           return false;
         }
-        const thinkingItem = thinkingMenuItem();
-        if (!thinkingItem) {
+        const target = desiredModel(models, settings);
+        if (!target?.element) {
           await closeModeMenu();
+          if (!quiet) showToast(text.unavailable, true);
+          return false;
+        }
+
+        if (shouldPauseForUserInput({ allowFocusedComposer }) || userEditedAfter(focusSnapshot)) {
+          await closeModeMenu(captureComposerFocus() || focusSnapshot);
+          return false;
+        }
+        target.element.click();
+        restoreComposerFocus(focusSnapshot);
+
+        const modelSelected = await waitFor(() => {
+          const updated = modeButton();
+          return updated && currentMatchesModel(settings, updated) && updated;
+        }, 5000);
+
+        if (!modelSelected) {
+          if (!quiet) showToast(text.unavailable, true);
+          return false;
+        }
+        await sleep(200);
+      }
+
+      // Check and apply thinking level
+      if (currentThinkingMode() !== settings.thinking) {
+        if (shouldPauseForUserInput({ allowFocusedComposer }) || userEditedAfter(focusSnapshot)) return false;
+
+        const thinkingApplied = await selectThinkingLevel(settings.thinking);
+        restoreComposerFocus(focusSnapshot);
+
+        if (!thinkingApplied) {
           if (!quiet) showToast(text.thinkingUnavailable, true);
           return false;
         }
-        thinkingItem.click();
-        restoreComposerFocus(focusSnapshot);
       }
 
       const applied = await waitFor(() => isDesiredState(settings), 5000);
@@ -551,7 +693,7 @@
   function handleReset() {
     saveSettings(DEFAULT_SETTINGS);
     ui.shadow.querySelector('[data-field="enabled"]').checked = true;
-    ui.shadow.querySelector('[data-field="thinking"]').value = 'extended';
+    ui.shadow.querySelector('[data-field="thinking"]').value = DEFAULT_SETTINGS.thinking;
     renderModelOptions([]);
     showToast(text.resetDone);
   }
@@ -572,7 +714,7 @@
     const host = document.createElement('div');
     host.id = SCRIPT_ID;
     const shadow = host.attachShadow({ mode: 'open' });
-    shadow.innerHTML = `
+    setSafeHTML(shadow, `
       <style>
         :host { all: initial; }
         *, *::before, *::after { box-sizing: border-box; }
@@ -652,8 +794,9 @@
           <label class="toggle"><input type="checkbox" data-field="enabled"> ${text.enabled}</label>
           <label class="field"><span>${text.model}</span><select data-field="model"></select></label>
           <label class="field"><span>${text.thinking}</span><select data-field="thinking">
-            <option value="standard">${text.standard}</option>
-            <option value="extended">${text.extended}</option>
+            <option value="low">${text.thinkingLow}</option>
+            <option value="medium">${text.thinkingMedium}</option>
+            <option value="high">${text.thinkingHigh}</option>
           </select></label>
           <p class="status" data-status aria-live="polite"></p>
           <div class="actions">
@@ -664,7 +807,7 @@
         </section>
       </div>
       <div class="toast" data-toast hidden role="status" aria-live="polite"></div>
-    `;
+    `);
 
     document.body.append(host);
     ui = { host, shadow, toastTimer: 0 };

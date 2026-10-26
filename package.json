@@ -1,8 +1,8 @@
 {
   "name": "gemini-default-model-selector",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "private": true,
-  "description": "A userscript that applies a preferred Gemini model and thinking mode on every new chat.",
+  "description": "A userscript that applies a preferred Gemini model and thinking level on every new chat.",
   "scripts": {
     "check": "node --check gemini-default-model-selector.user.js"
   },
