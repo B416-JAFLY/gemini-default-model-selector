@@ -2,7 +2,7 @@
 // @name         Gemini Default Model Selector
 // @name:zh-CN   Gemini 默认模型选择器
 // @namespace    https://github.com/B416-JAFLY/gemini-default-model-selector
-// @version      0.3.1
+// @version      0.3.2
 // @description  Automatically select your preferred Gemini model and thinking level for every new chat.
 // @description:zh-CN 为 Gemini 新对话自动选择默认模型与思考等级，并提供随时可修改的设置面板。
 // @author       B416-JAFLY
@@ -36,9 +36,9 @@
   const SEND_BUTTON_SELECTOR = [
     'button[aria-label*="发送"]',
     'button[aria-label*="Send" i]',
-    '[role="button"][aria-label*="发送"]',
-    '[role="button"][aria-label*="Send" i]',
-    '[data-test-id*="send" i]',
+    'button[data-test-id*="send" i]',
+    '[data-test-id*="send" i] button',
+    'gem-icon-button.send-button button',
   ].join(',');
   const COMPOSER_SELECTOR = [
     'textarea',
@@ -223,11 +223,17 @@
   }
 
   function sendButton() {
-    return [...document.querySelectorAll(SEND_BUTTON_SELECTOR)].find((element) => {
-      return isVisible(element) &&
-        element.getAttribute('aria-disabled') !== 'true' &&
-        !element.disabled;
-    }) || null;
+    const directBtn = document.querySelector('button[aria-label*="发送"], button[aria-label*="Send" i]');
+    if (directBtn && isVisible(directBtn) && !directBtn.disabled && directBtn.getAttribute('aria-disabled') !== 'true') {
+      return directBtn;
+    }
+    for (const el of document.querySelectorAll(SEND_BUTTON_SELECTOR)) {
+      const target = el.tagName === 'BUTTON' ? el : el.querySelector('button');
+      if (target && isVisible(target) && !target.disabled && target.getAttribute('aria-disabled') !== 'true') {
+        return target;
+      }
+    }
+    return null;
   }
 
   function composerElement(element) {
@@ -516,7 +522,7 @@
   } = {}) {
     if (working || !isHomePage() || (!force && !settings.enabled)) return false;
     if (isDesiredState(settings)) return true;
-    if (shouldPauseForUserInput({ allowFocusedComposer })) {
+    if (!force && shouldPauseForUserInput({ allowFocusedComposer })) {
       if (!quiet) showToast(text.deferred);
       return false;
     }
@@ -526,12 +532,12 @@
     try {
       const button = await waitFor(modeButton);
       if (!button || !isHomePage()) return false;
-      if (shouldPauseForUserInput({ allowFocusedComposer })) return false;
+      if (!force && shouldPauseForUserInput({ allowFocusedComposer })) return false;
 
       // Always select base model first if it does not match
       if (!currentMatchesModel(settings, button)) {
         const models = await openModeMenu();
-        if (shouldPauseForUserInput({ allowFocusedComposer }) || userEditedAfter(focusSnapshot)) {
+        if (!force && (shouldPauseForUserInput({ allowFocusedComposer }) || userEditedAfter(focusSnapshot))) {
           await closeModeMenu(captureComposerFocus() || focusSnapshot);
           return false;
         }
@@ -542,7 +548,7 @@
           return false;
         }
 
-        if (shouldPauseForUserInput({ allowFocusedComposer }) || userEditedAfter(focusSnapshot)) {
+        if (!force && (shouldPauseForUserInput({ allowFocusedComposer }) || userEditedAfter(focusSnapshot))) {
           await closeModeMenu(captureComposerFocus() || focusSnapshot);
           return false;
         }
@@ -563,7 +569,7 @@
 
       // Check and apply thinking level
       if (currentThinkingMode() !== settings.thinking) {
-        if (shouldPauseForUserInput({ allowFocusedComposer }) || userEditedAfter(focusSnapshot)) return false;
+        if (!force && (shouldPauseForUserInput({ allowFocusedComposer }) || userEditedAfter(focusSnapshot))) return false;
 
         const thinkingApplied = await selectThinkingLevel(settings.thinking);
         restoreComposerFocus(focusSnapshot);
@@ -608,45 +614,61 @@
     }
 
     restoreComposerFocus(focusSnapshot);
-    await sleep(60);
+    await sleep(80);
 
     const button = await waitFor(() => {
-      return sendButton() || (originalButton?.isConnected ? originalButton : null);
+      const current = sendButton();
+      if (current) return current;
+      if (originalButton?.isConnected && originalButton.tagName === 'BUTTON') return originalButton;
+      return null;
     }, 3000);
 
     if (!button) {
-      showToast(text.submitFallback, true);
+      if (!applied && !isDesiredState(settings)) showToast(text.submitFallback, true);
+      // Fallback: simulate Enter key on composer
+      const composer = focusSnapshot?.element || activeComposer() || document.querySelector('.ql-editor');
+      if (composer) {
+        replayingSubmit = true;
+        try {
+          composer.dispatchEvent(new KeyboardEvent('keydown', {
+            key: 'Enter',
+            code: 'Enter',
+            keyCode: 13,
+            which: 13,
+            bubbles: true,
+            cancelable: true,
+            composed: true,
+          }));
+        } finally {
+          setTimeout(() => {
+            replayingSubmit = false;
+            submitting = false;
+          }, 150);
+        }
+        return;
+      }
       submitting = false;
       return;
     }
+
     if (!applied && !isDesiredState(settings)) showToast(text.submitFallback, true);
 
     replayingSubmit = true;
     try {
-      // 1. Dispatch full pointer event sequence for Angular MDC Send button
-      const rect = button.getBoundingClientRect();
-      const clientX = rect.left + rect.width / 2;
-      const clientY = rect.top + rect.height / 2;
-      const opts = { bubbles: true, cancelable: true, view: window, clientX, clientY };
-      button.dispatchEvent(new PointerEvent('pointerdown', opts));
-      button.dispatchEvent(new MouseEvent('mousedown', opts));
-      button.dispatchEvent(new PointerEvent('pointerup', opts));
-      button.dispatchEvent(new MouseEvent('mouseup', opts));
       button.click();
-
-      // 2. Also simulate Enter key on the composer if still focused
-      const composer = focusSnapshot?.element || activeComposer();
-      if (composer && isVisible(composer)) {
-        const keyOpts = {
+    } catch (err) {
+      console.warn(`[${SCRIPT_ID}] button.click failed, trying enter on composer`, err);
+      const composer = focusSnapshot?.element || activeComposer() || document.querySelector('.ql-editor');
+      if (composer) {
+        composer.dispatchEvent(new KeyboardEvent('keydown', {
           key: 'Enter',
           code: 'Enter',
           keyCode: 13,
           which: 13,
           bubbles: true,
           cancelable: true,
-        };
-        composer.dispatchEvent(new KeyboardEvent('keydown', keyOpts));
-        composer.dispatchEvent(new KeyboardEvent('keyup', keyOpts));
+          composed: true,
+        }));
       }
     } finally {
       setTimeout(() => {
@@ -657,7 +679,7 @@
   }
 
   function interceptSubmit(event, originalButton = sendButton()) {
-    if (replayingSubmit || submitting || !originalButton || !shouldInterceptSubmit()) return;
+    if (replayingSubmit || submitting || !shouldInterceptSubmit()) return;
     const focusSnapshot = captureComposerFocus();
     event.preventDefault();
     event.stopImmediatePropagation();
@@ -1054,7 +1076,8 @@
   }, true);
   document.addEventListener('click', (event) => {
     const target = event.target instanceof Element ? event.target.closest(SEND_BUTTON_SELECTOR) : null;
-    if (target && isVisible(target)) interceptSubmit(event, target);
+    const realBtn = target?.tagName === 'BUTTON' ? target : target?.querySelector('button');
+    if (realBtn && isVisible(realBtn)) interceptSubmit(event, realBtn);
   }, true);
   document.addEventListener('pointerdown', (event) => {
     if (event.isTrusted && modeControlElement(event.target)) {
